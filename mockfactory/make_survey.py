@@ -1143,7 +1143,7 @@ class RandomCutskyCatalog(CutskyCatalog):
     @CurrentMPIComm.enable
     def __init__(self, rarange=(0., 360.), decrange=(-90., 90.), drange=None, csize=None, nbar=None, seed=None, **kwargs):
         """
-        Initialize :class:`RandomCutskyCatalog`, with a uniform sampling on the sky and as a function of distance.
+        Initialize :class:`RandomCutskyCatalog`, with a uniform sampling on the sky and a constant volume density as a function of distance.
         Set columns 'RA' (degree), 'DEC' (degree), 'Distance' and ``position``.
 
         Parameters
@@ -1432,7 +1432,7 @@ class TabulatedRadialMask(BaseRadialMask):
         ----------
         norm : float, default=None
             Factor to scale :attr:`nbar`.
-            Defaults to maximum of interpolated :attr:`nbar` in redshift range.
+            Defaults to maximum of interpolated :attr:`nbar`.
 
         interp_order : int, default=None
             If not ``None``, replace :attr:`interp_order`.
@@ -1443,27 +1443,44 @@ class TabulatedRadialMask(BaseRadialMask):
             self.interp_order = 3
 
         if norm is None:
-            self.norm = 1.
+            self.norm = None
             self._set_interp()
 
-            def solve_newton(x, fun, grad):
-                v = fun(x)
-                while (np.abs(v) > 1e-15):
-                    x -= v / grad(x)
-                    v = fun(x)
-                return x
-
             grad = self.interp.derivative()
-            jac = grad.derivative()
+            try:
+                jac = grad.derivative()
+            except ValueError:  # no second derivative
+                m = self.nbar[(self.z >= self.zrange[0]) & (self.z <= self.zrange[-1])].max()
+                norm = 1. / max(m, self.interp(self.zrange[0]), self.interp(self.zrange[-1]))
+            else:
 
-            # Finer binning to account for interpolation
-            z = np.linspace(self.z[0], self.z[-1], len(self.z) * self.interp_order)
-            nz = self.interp(z)
-            nbar_max = self.interp(solve_newton(z[np.argmax(nz)], grad, jac))
-            nbar_max = self.mpicomm.bcast(nbar_max, root=self.mpiroot)
-            if np.any(nbar_max < nz):
-                raise ValueError('Could not find maximum of nbar')
-            norm = 1. / nbar_max
+                def solve_newton(x, fun, grad, crit):
+                    xnew = x - fun(x) / grad(x)
+                    xnew = max(xnew, self.zrange[0])
+                    xnew = min(xnew, self.zrange[-1])
+                    while not crit(x, xnew):
+                        x = xnew
+                        xnew -= fun(x) / grad(x)
+                    return x
+
+                # Finer binning to account for interpolation
+                z = np.linspace(self.z[0], self.z[-1], len(self.z) * self.interp_order)
+                nz = self.interp(z)
+                argmax = np.argmax(nz)
+                if np.allclose(nz, nz[0]):
+                    nbar_max = nz[argmax]
+                else:
+                    prec = 1e-6 * (nz[argmax] - nz.min())
+
+                    def crit(x, xnew):
+                        return np.abs(self.interp(xnew) - self.interp(x)) < prec
+
+                    nbar_max = self.interp(solve_newton(z[argmax], grad, jac, crit=crit))
+                nbar_max = self.mpicomm.bcast(nbar_max, root=self.mpiroot)
+                if np.any(nbar_max < nz):
+                    raise ValueError('Could not find maximum of nbar')
+
+                norm = 1. / nbar_max
 
         self.norm = norm
         self._set_interp()
@@ -1471,7 +1488,9 @@ class TabulatedRadialMask(BaseRadialMask):
 
     def _set_interp(self):
         # Set :attr:`interp`, the end user does not need to call it
-        prob = np.clip(self.norm * self.nbar, 0., 1.)
+        prob = self.nbar
+        if self.norm is not None:
+            prob = np.minimum(self.norm * self.nbar, 1.)
         self.interp = interpolate.UnivariateSpline(self.z, prob, k=self.interp_order, s=0, ext='zeros')
 
     @property
@@ -1609,7 +1628,7 @@ class BaseAngularMask(BaseMask):
     Subclasses should at least implement :meth:`prob`.
     """
     @CurrentMPIComm.enable
-    def __init__(self, rarange=None, decrange=None, mpicomm=None, mpiroot=0):
+    def __init__(self, rarange=None, decrange=None, mpicomm=None):
         """
         Initialize :class:`BaseRadialMask`.
 
@@ -1625,7 +1644,11 @@ class BaseAngularMask(BaseMask):
             The current MPI communicator.
         """
         if rarange is not None:
+            rarange = tuple(rarange)
+            direct = rarange[0] < rarange[-1]
             rarange = utils.wrap_angle(rarange, degree=True)
+            if direct and rarange[1] <= rarange[0]:  # typically, (0., 360.)
+                rarange = (rarange[0], rarange[1] + 360.)
             # if e.g. rarange = (300, 40), we want to select RA > 300 or RA < 40
             self.rarange = tuple(rarange)
         else:
